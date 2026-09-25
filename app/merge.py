@@ -10,6 +10,11 @@
 
 差异计算是纯函数，预览不触碰数据库；确认时由
 ``database.merge_scores`` 在单个事务内落库。
+
+预览基线（``current_basis``）除评分快照外，还为「分数变更/将删除」
+两类受影响评分记录裁决状态（是否存在、采用原分、理由）；确认时由
+``basis_matches`` 连同评分一起核对，任何变化都判为过期预览（409），
+避免预览后新增的裁决被静默清除。
 """
 from __future__ import annotations
 
@@ -152,26 +157,93 @@ def build_merge_plan(
     }
 
 
-def current_basis(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """生成确认时回传的「预览基线」快照。"""
-    return [
-        {
+def current_basis(
+    records: Sequence[Mapping[str, Any]],
+    decision_snapshots: Mapping[int, Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """生成确认时回传的「预览基线」快照。
+
+    每条记录含 选手/评委/项目/分数；对合并时将被清除裁决的受影响评分
+    （分数变更/将删除），另附 ``decision`` 字段记录其裁决状态
+    （``None`` 表示无裁决，否则为 {"use_raw", "reason"}），供确认时核对。
+    """
+    decision_snapshots = decision_snapshots or {}
+    basis: list[dict[str, Any]] = []
+    for r in records:
+        entry: dict[str, Any] = {
             "contestant": r["contestant"],
             "judge": r["judge"],
             "item": r["item"],
             "score": float(r["score"]),
         }
-        for r in records
-    ]
+        if r["id"] in decision_snapshots:
+            snap = decision_snapshots[r["id"]]
+            entry["decision"] = (
+                None
+                if snap is None
+                else {"use_raw": bool(snap["use_raw"]), "reason": str(snap["reason"])}
+            )
+        basis.append(entry)
+    return basis
+
+
+def valid_basis_shape(raw: Any) -> bool:
+    """校验客户端回传的基线快照格式（含受影响行的裁决快照字段）。"""
+    if not isinstance(raw, list):
+        return False
+    for item in raw:
+        if not (
+            isinstance(item, Mapping)
+            and isinstance(item.get("contestant"), str)
+            and isinstance(item.get("judge"), str)
+            and isinstance(item.get("item"), str)
+            and isinstance(item.get("score"), (int, float))
+            and not isinstance(item.get("score"), bool)
+        ):
+            return False
+        if "decision" in item:
+            snap = item["decision"]
+            if snap is not None and not (
+                isinstance(snap, Mapping)
+                and isinstance(snap.get("use_raw"), bool)
+                and isinstance(snap.get("reason"), str)
+            ):
+                return False
+    return True
+
+
+def _decision_snapshot_matches(snapshot: Any, verdict: Any) -> bool:
+    """比对基线中的裁决快照与库内裁决（verdict 为 (use_raw, reason) 或 None）。"""
+    if snapshot is None:
+        return verdict is None
+    if verdict is None or not isinstance(snapshot, Mapping):
+        return False
+    try:
+        return (
+            snapshot["use_raw"] is bool(verdict[0])
+            and str(snapshot["reason"]) == (verdict[1] or "")
+        )
+    except (KeyError, TypeError):
+        return False
 
 
 def basis_matches(
     basis: Sequence[Mapping[str, Any]],
     current: Sequence[Mapping[str, Any]],
+    decisions: Mapping[int, Any] | None = None,
+    affected_ids: set[int] | None = None,
 ) -> bool:
-    """核对客户端回传的基线是否仍与库内数据一致。"""
+    """核对客户端回传的基线是否仍与库内数据一致。
+
+    逐条比对评分（选手/评委/项目/分数）；对 ``affected_ids`` 中的受影响
+    评分（合并将清除其裁决的行），还要求基线携带 ``decision`` 快照且与
+    库内裁决状态（存在性、采用原分、理由）完全一致——预览后裁决被新增、
+    修改或删除都会判为不匹配。未受影响行不得携带 ``decision`` 字段。
+    未传 ``decisions``/``affected_ids`` 时退化为仅核对评分（旧行为）。
+    """
     if len(basis) != len(current):
         return False
+    check_decisions = decisions is not None and affected_ids is not None
     for b, rec in zip(basis, current):
         try:
             if (
@@ -183,6 +255,14 @@ def basis_matches(
                 return False
         except (KeyError, TypeError, ValueError):
             return False
+        if check_decisions:
+            affected = rec["id"] in affected_ids
+            if affected != ("decision" in b):
+                return False
+            if affected and not _decision_snapshot_matches(
+                b["decision"], decisions.get(rec["id"])
+            ):
+                return False
     return True
 
 

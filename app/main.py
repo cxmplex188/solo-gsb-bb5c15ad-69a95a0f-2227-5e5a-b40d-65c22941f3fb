@@ -16,12 +16,15 @@ from .common_judge import common_judge_comparison
 from .csv_io import CSVParseError, build_audit_csv, parse_scores
 from .judge_offsets import judge_offset_diagnosis
 from .merge import (
+    STATUS_CHANGED,
     STATUS_LABELS as MERGE_STATUS_LABELS,
+    STATUS_REMOVED,
     MergeValidationError,
     basis_matches,
     build_merge_plan,
     current_basis,
     normalize_incoming_records,
+    valid_basis_shape,
 )
 from .pending_rank import PendingRankValidationError, pending_rank_bounds
 from .promotion import PromotionValidationError, promotion_check
@@ -270,6 +273,16 @@ async def merge_preview(
         current = db.load_scores(conn, session_id)
         decisions = db.load_decisions(conn, session_id)
         plan = build_merge_plan(current, records, decisions)
+        # 受影响评分（分数变更/将删除）的裁决状态一并记入基线，确认时核对。
+        decision_snapshots = {
+            row["score_id"]: (
+                {"use_raw": row["old_use_raw"], "reason": row["old_reason"]}
+                if row["has_decision"]
+                else None
+            )
+            for row in plan["rows"]
+            if row["status"] in (STATUS_CHANGED, STATUS_REMOVED)
+        }
     return {
         "scope": effective_scope,
         "scope_label": SCOPE_LABELS[effective_scope],
@@ -282,7 +295,7 @@ async def merge_preview(
         "will_modify": plan["will_modify"],
         "decisions_cleared": plan["decisions_cleared"],
         "records": records,
-        "basis": current_basis(current),
+        "basis": current_basis(current, decision_snapshots),
     }
 
 
@@ -291,36 +304,36 @@ def merge_confirm(session_id: str, body: MergeConfirmBody) -> dict[str, Any]:
     """确认合并：在同一个数据库事务中落库预览结果。
 
     分数变更/删除记录的旧裁决在事务内自动清除；未变记录及其裁决、已保存的
-    批处理规则均不触碰。若预览后会话数据被其他操作改动（基线不匹配），
-    返回 409 要求重新预览，绝不覆盖。
+    批处理规则均不触碰。确认时在同一事务内先核对预览基线：除全部评分外，
+    还包括受影响评分（分数变更/将删除）的裁决状态（存在性、采用原分、
+    理由）；预览后这些数据被其他操作改动（含新增/修改/删除相关裁决）时
+    返回 409 要求重新预览，且不写入任何合并结果。
     """
     try:
         records = normalize_incoming_records(body.records)
     except MergeValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    if not all(
-        isinstance(item, dict)
-        and isinstance(item.get("contestant"), str)
-        and isinstance(item.get("judge"), str)
-        and isinstance(item.get("item"), str)
-        and isinstance(item.get("score"), (int, float))
-        and not isinstance(item.get("score"), bool)
-        for item in body.basis
-    ):
+    if not valid_basis_shape(body.basis):
         raise HTTPException(status_code=400, detail="basis 基线快照格式不正确，请重新预览。")
     with db.get_conn() as conn:
         current = db.load_scores(conn, session_id)
         decisions = db.load_decisions(conn, session_id)
         stored_scope = db.get_scope(conn, session_id)
-        if not basis_matches(body.basis, current):
+        plan = build_merge_plan(current, records, decisions)
+        affected_ids = {
+            row["score_id"]
+            for row in plan["rows"]
+            if row["status"] in (STATUS_CHANGED, STATUS_REMOVED)
+        }
+        # 核对先于一切写入，且与写入处于同一事务；不匹配则整体放弃。
+        if not basis_matches(body.basis, current, decisions, affected_ids):
             raise HTTPException(
                 status_code=409,
                 detail="预览后当前会话数据已变化，请重新预览后再确认合并。",
             )
-        plan = build_merge_plan(current, records, decisions)
-        # 全部变更随本事务一起提交；任何失败整体回滚。
         if stored_scope is None:
             db.ensure_session(conn, session_id, body.scope or SCOPE_JUDGE)
+        # 全部变更随本事务一起提交；任何失败整体回滚。
         result = db.merge_scores(conn, session_id, plan["rows"])
         scope = _resolve_scope(conn, session_id, None)
         analysis = _build_analysis(conn, session_id, scope)

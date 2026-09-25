@@ -18,6 +18,7 @@ from app.merge import (
     build_merge_plan,
     current_basis,
     normalize_incoming_records,
+    valid_basis_shape,
 )
 
 
@@ -188,6 +189,135 @@ class TestBasis(unittest.TestCase):
         # Malformed basis entries do not raise but never match.
         self.assertFalse(basis_matches([{"contestant": "A"}], self.current))
         self.assertFalse(basis_matches(["nope"], self.current))
+
+
+class TestBasisDecisionSnapshots(unittest.TestCase):
+    """受影响评分（分数变更/将删除）的裁决状态进入基线并参与核对。"""
+
+    def setUp(self):
+        self.current = cur([("A", "J", "P", 5.0), ("B", "J", "P", 6.0)])
+        self.decisions = {1: (True, "保留理由")}
+        self.affected = {1}
+        self.snapshots = {1: {"use_raw": True, "reason": "保留理由"}}
+        self.basis = current_basis(self.current, self.snapshots)
+
+    def test_basis_carries_snapshot_only_for_affected_rows(self):
+        self.assertEqual(
+            self.basis[0]["decision"], {"use_raw": True, "reason": "保留理由"}
+        )
+        self.assertNotIn("decision", self.basis[1])
+        # 受影响但无裁决：显式记录 None（存在性也要核对）。
+        none_basis = current_basis(self.current, {1: None})
+        self.assertIn("decision", none_basis[0])
+        self.assertIsNone(none_basis[0]["decision"])
+
+    def test_roundtrip_matches(self):
+        self.assertTrue(
+            basis_matches(self.basis, self.current, self.decisions, self.affected)
+        )
+
+    def test_decision_added_after_preview_conflicts(self):
+        basis = current_basis(self.current, {1: None})
+        self.assertTrue(basis_matches(basis, self.current, {}, self.affected))
+        # 预览后新增裁决 → 不匹配。
+        self.assertFalse(
+            basis_matches(basis, self.current, self.decisions, self.affected)
+        )
+
+    def test_decision_modified_or_removed_conflicts(self):
+        self.assertFalse(
+            basis_matches(
+                self.basis, self.current, {1: (False, "保留理由")}, self.affected
+            )
+        )
+        self.assertFalse(
+            basis_matches(
+                self.basis, self.current, {1: (True, "改了")}, self.affected
+            )
+        )
+        self.assertFalse(basis_matches(self.basis, self.current, {}, self.affected))
+
+    def test_unaffected_rows_decision_not_checked(self):
+        # 未受影响行（B）的裁决变化不影响核对结果。
+        self.assertTrue(
+            basis_matches(
+                self.basis,
+                self.current,
+                {1: (True, "保留理由"), 2: (False, "随便改")},
+                self.affected,
+            )
+        )
+
+    def test_marker_mismatch_conflicts(self):
+        # 受影响行缺少 decision 快照。
+        bare = [dict(b) for b in self.basis]
+        del bare[0]["decision"]
+        self.assertFalse(basis_matches(bare, self.current, self.decisions, self.affected))
+        # 未受影响行多带 decision 快照。
+        extra = [dict(b) for b in self.basis]
+        extra[1]["decision"] = None
+        self.assertFalse(
+            basis_matches(extra, self.current, self.decisions, self.affected)
+        )
+
+    def test_malformed_snapshot_never_matches(self):
+        bad = [dict(b) for b in self.basis]
+        bad[0]["decision"] = {"use_raw": "yes", "reason": 1}
+        self.assertFalse(basis_matches(bad, self.current, self.decisions, self.affected))
+
+    def test_without_decision_args_keeps_score_only_behavior(self):
+        self.assertTrue(basis_matches(self.basis, self.current))
+        self.assertTrue(basis_matches(self.basis, self.current, self.decisions))
+        self.assertTrue(basis_matches(self.basis, self.current, None, self.affected))
+
+
+class TestValidBasisShape(unittest.TestCase):
+    def test_accepts_score_only_and_snapshot_entries(self):
+        self.assertTrue(valid_basis_shape([]))
+        self.assertTrue(
+            valid_basis_shape(
+                [
+                    {"contestant": "A", "judge": "J", "item": "P", "score": 5.0},
+                    {
+                        "contestant": "B",
+                        "judge": "J",
+                        "item": "P",
+                        "score": 6,
+                        "decision": {"use_raw": True, "reason": "r"},
+                    },
+                    {
+                        "contestant": "C",
+                        "judge": "J",
+                        "item": "P",
+                        "score": 7.0,
+                        "decision": None,
+                    },
+                ]
+            )
+        )
+
+    def test_rejects_malformed_entries(self):
+        self.assertFalse(valid_basis_shape("nope"))
+        self.assertFalse(valid_basis_shape([{"contestant": "A"}]))
+        self.assertFalse(
+            valid_basis_shape(
+                [{"contestant": "A", "judge": "J", "item": "P", "score": True}]
+            )
+        )
+        for bad_decision in ({"use_raw": "yes", "reason": "r"}, {"use_raw": True}, "x"):
+            self.assertFalse(
+                valid_basis_shape(
+                    [
+                        {
+                            "contestant": "A",
+                            "judge": "J",
+                            "item": "P",
+                            "score": 1.0,
+                            "decision": bad_decision,
+                        }
+                    ]
+                )
+            )
 
 
 class TestNormalizeIncomingRecords(unittest.TestCase):

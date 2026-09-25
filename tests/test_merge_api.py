@@ -275,6 +275,123 @@ class TestMergeAPI(unittest.TestCase):
         self.assertEqual(m[("C1", "JA", "P1")]["raw"], 9.9)  # no phantom -999
         self.assertEqual(len(m), before["counts"]["scores"])  # no added/removed leaked
 
+    # --- 预览基线同时核对受影响评分的裁决状态 ---
+
+    def test_11_decision_added_after_preview_conflicts(self):
+        self.assertEqual(upload(INITIAL).status_code, 200)
+        # C2/JB/P1 是分数变更行且本无裁决；预览后给它新增裁决。
+        p = preview(MERGED).json()
+        self.assertEqual(p["counts"]["changed"], 2)
+        # 基线中受影响行（变更/删除）带 decision 快照，未变行不带。
+        by_key = {(b["contestant"], b["judge"], b["item"]): b for b in p["basis"]}
+        self.assertIsNone(by_key[("C2", "JB", "P1")]["decision"])
+        self.assertIsNone(by_key[("C2", "JA", "P1")]["decision"])
+        self.assertNotIn("decision", by_key[("C1", "JB", "P1")])
+
+        analysis = client.get(f"/api/sessions/{SID}/analysis").json()
+        id_of = {(b["contestant"], s["judge"], ib["item"]): s["id"]
+                 for b in analysis["contestants"] for ib in b["items"] for s in ib["scores"]}
+        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C2', 'JB', 'P1')]}/decision",
+                     json={"use_raw": True, "reason": "预览后新增"})
+
+        r = confirm({"records": p["records"], "basis": p["basis"]})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("重新预览", r.json()["detail"])
+        # 未写入任何合并结果：分数与裁决原样保留。
+        after = client.get(f"/api/sessions/{SID}/analysis").json()
+        self.assertEqual(after["counts"]["scores"], 4)
+        self.assertEqual(after["counts"]["decisions"], 1)
+        m = score_map(after)
+        self.assertEqual(m[("C2", "JB", "P1")]["raw"], 6.0)
+        self.assertTrue(m[("C2", "JB", "P1")]["use_raw"])
+        self.assertEqual(m[("C2", "JB", "P1")]["reason"], "预览后新增")
+
+    def test_12_decision_modified_or_removed_after_preview_conflicts(self):
+        self.assertEqual(upload(INITIAL).status_code, 200)
+        analysis = client.get(f"/api/sessions/{SID}/analysis").json()
+        id_of = {(b["contestant"], s["judge"], ib["item"]): s["id"]
+                 for b in analysis["contestants"] for ib in b["items"] for s in ib["scores"]}
+        # C1/JA/P1 是分数变更行，预览前已有裁决。
+        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C1', 'JA', 'P1')]}/decision",
+                     json={"use_raw": True, "reason": "原始裁决"})
+        p = preview(MERGED).json()
+        by_key = {(b["contestant"], b["judge"], b["item"]): b for b in p["basis"]}
+        self.assertEqual(
+            by_key[("C1", "JA", "P1")]["decision"],
+            {"use_raw": True, "reason": "原始裁决"},
+        )
+
+        # 预览后修改该裁决 → 409，且裁决保持修改后的样子（未被合并清除）。
+        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C1', 'JA', 'P1')]}/decision",
+                     json={"use_raw": False, "reason": "预览后修改"})
+        r = confirm({"records": p["records"], "basis": p["basis"]})
+        self.assertEqual(r.status_code, 409)
+        after = client.get(f"/api/sessions/{SID}/analysis").json()
+        self.assertEqual(after["counts"]["scores"], 4)
+        m = score_map(after)
+        self.assertFalse(m[("C1", "JA", "P1")]["use_raw"])
+        self.assertEqual(m[("C1", "JA", "P1")]["reason"], "预览后修改")
+
+        # 预览后删除该裁决 → 同样 409。
+        p2 = preview(MERGED).json()
+        client.post(f"/api/sessions/{SID}/decisions/reset")
+        r = confirm({"records": p2["records"], "basis": p2["basis"]})
+        self.assertEqual(r.status_code, 409)
+        after = client.get(f"/api/sessions/{SID}/analysis").json()
+        self.assertEqual(after["counts"]["scores"], 4)
+        self.assertEqual(after["counts"]["decisions"], 0)
+
+    def test_13_unchanged_row_decision_change_does_not_block(self):
+        self.assertEqual(upload(INITIAL).status_code, 200)
+        analysis = client.get(f"/api/sessions/{SID}/analysis").json()
+        id_of = {(b["contestant"], s["judge"], ib["item"]): s["id"]
+                 for b in analysis["contestants"] for ib in b["items"] for s in ib["scores"]}
+        # 变更行 C1/JA/P1 与未变行 C1/JB/P1 各置一条裁决。
+        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C1', 'JA', 'P1')]}/decision",
+                     json={"use_raw": True, "reason": "将被清除"})
+        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C1', 'JB', 'P1')]}/decision",
+                     json={"use_raw": True, "reason": "未变行原裁决"})
+        p = preview(MERGED).json()
+        self.assertEqual(p["decisions_cleared"], 1)
+
+        # 预览后只改未变行的裁决 → 不阻塞合并。
+        client.patch(f"/api/sessions/{SID}/scores/{id_of[('C1', 'JB', 'P1')]}/decision",
+                     json={"use_raw": False, "reason": "预览后改过的未变行裁决"})
+        r = confirm({"records": p["records"], "basis": p["basis"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["merge_applied"]["decisions_cleared"], 1)
+        # counts["decisions"] 只统计「保留原分」的裁决；唯一存活的未变行裁决
+        # 已被改成 use_raw=False，故计数为 0。
+        self.assertEqual(data["counts"]["decisions"], 0)
+        # 未变行的裁决按预览后的新状态原样保留（理由仍在即裁决行未被删）。
+        keep = score_map(data)[("C1", "JB", "P1")]
+        self.assertFalse(keep["use_raw"])
+        self.assertEqual(keep["reason"], "预览后改过的未变行裁决")
+
+    def test_14_malformed_decision_snapshot_is_400(self):
+        self.assertEqual(upload(INITIAL).status_code, 200)
+        p = preview(MERGED).json()
+        # 受影响行的 decision 快照格式非法 → 400（非 409）。
+        bad = [dict(b) for b in p["basis"]]
+        target = next(b for b in bad if "decision" in b)
+        target["decision"] = {"use_raw": "yes", "reason": 1}
+        r = confirm({"records": p["records"], "basis": bad})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("重新预览", r.json()["detail"])
+        # 未受影响行不得携带 decision 字段 → 409 状态不匹配。
+        tampered = [dict(b) for b in p["basis"]]
+        extra = next(
+            b for b in tampered
+            if (b["contestant"], b["judge"], b["item"]) == ("C1", "JB", "P1")
+        )
+        extra["decision"] = None
+        r = confirm({"records": p["records"], "basis": tampered})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(
+            client.get(f"/api/sessions/{SID}/analysis").json()["counts"]["scores"], 4
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

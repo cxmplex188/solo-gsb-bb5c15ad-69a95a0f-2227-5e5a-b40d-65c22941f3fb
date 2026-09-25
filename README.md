@@ -53,7 +53,7 @@ docker compose down -v       # 停止并删除数据卷（清空全部数据）
    - **分数变更**：两边都有但分数不同，逐行显示**旧分数 → 新分数**；
    - **仅存在于当前会话（将删除）**：新文件中缺失的记录。
 
-   预览逐行列出新旧分数以及该行**将受影响的裁决**（分数变更/删除行若存在旧裁决会标记「旧裁决将清除」并展示其原内容；未变行的裁决标记「保留」），顶部汇总各类条数与将清除的裁决数。预览**完全只读**：不点确认、或点「取消」都不会改动任何数据。确认后所有更新、删除、新增与旧裁决清除在**同一个数据库事务**中提交（任一步失败整体回滚）；**未变记录（含其裁决）与已保存的批处理规则始终保持不动**。为防止预览过期，确认时服务端会核对预览基线，数据已被其他操作改动时返回 `409`，要求重新预览。
+   预览逐行列出新旧分数以及该行**将受影响的裁决**（分数变更/删除行若存在旧裁决会标记「旧裁决将清除」并展示其原内容；未变行的裁决标记「保留」），顶部汇总各类条数与将清除的裁决数。预览**完全只读**：不点确认、或点「取消」都不会改动任何数据。确认后所有更新、删除、新增与旧裁决清除在**同一个数据库事务**中提交（任一步失败整体回滚）；**未变记录（含其裁决）与已保存的批处理规则始终保持不动**。为防止预览过期，预览基线会同时快照评分与受影响记录的旧裁决状态（存在性、采用原分、理由）；确认时在同一事务内一并核对，评分或相关旧裁决在预览后被新增/修改时返回 `409`，要求重新预览，且不写入任何合并结果。
 4. **一键载入示例数据**：内置 6 位选手 × 4 位评委 × 3 个项目（72 条评分），其中包含刻意设置的宽松/严苛评委与人名前后名次反转（S03/S04 名次互换）。
 3. **稳健标准化**
    - 对每个校准分组计算中位数与 MAD（median absolute deviation）：
@@ -202,7 +202,7 @@ CALIB_DATA_DIR=$(mktemp -d) python -m pytest tests/ -q
 | GET | `/api/health` | 健康检查 |
 | POST | `/api/sessions/{id}/upload?scope=judge` | 上传 CSV（multipart `file`），**替换导入**：清空旧评分/裁决/规则 |
 | POST | `/api/sessions/{id}/merge/preview?scope=judge` | 合并导入**只读预览**（multipart `file`）：按三元组返回新增/未变/变更/仅当前会话逐行差异、新旧分数、受影响裁决、汇总计数，并回传 `records` 与基线 `basis` 供确认使用；不落库 |
-| POST | `/api/sessions/{id}/merge/confirm` | **确认合并**（`{"records":[...], "basis":[...], "scope"?: "judge"\|"judge_item"}`）：同一事务完成更新/新增/删除并清除变更、删除行的旧裁决；未变记录与规则不动；基线不匹配返回 `409`，任一步失败整体回滚；返回刷新后的完整分析 |
+| POST | `/api/sessions/{id}/merge/confirm` | **确认合并**（`{"records":[...], "basis":[...], "scope"?: "judge"\|"judge_item"}`）：同一事务内先核对评分基线与受影响评分的旧裁决快照（存在性/采用原分/理由），再完成更新/新增/删除并清除变更、删除行的旧裁决（清除数量与预览一致）；未变记录的裁决与规则不动；评分或旧裁决在预览后变化均返回 `409` 要求重新预览且不写入，任一步失败整体回滚；返回刷新后的完整分析 |
 | POST | `/api/sessions/{id}/sample?scope=judge` | 载入内置示例数据 |
 | GET | `/api/sessions/{id}/analysis` | 获取完整分析结果（分组参数、总分、名次、反转、逐条分数、`judge_disagreement` 评委排序分歧、`judge_offsets` 评委严宽差异诊断） |
 | POST | `/api/sessions/{id}/scope` | 切换校准范围（`{"scope":"judge"\|"judge_item"}`） |
@@ -244,22 +244,23 @@ CALIB_DATA_DIR=$(mktemp -d) python -m pytest tests/ -q
 - `counts`：`{"changed": n, "added": n, "removed": n, "unchanged": n}`，另有 `will_modify`（前三类之和）、`decisions_cleared`（变更/删除行中带旧裁决的条数）、`total_current`、`total_incoming`；
 - `rows[]`：每行含 `status`（`changed`/`added`/`removed`/`unchanged`）、`contestant`/`judge`/`item`、`old_score`/`new_score`（不适用一侧为 `null`）、`score_id`（仅当前会话侧有）、`has_decision`、`old_use_raw`、`old_reason`、`decision_action`（`clear`=旧裁决将清除 / `keep`=裁决保留 / `none`=本无裁决）；
 - `records`：服务端解析后的新文件记录（确认时原样回传，服务端重新校验）；
-- `basis`：预览时刻当前会话的分数快照（确认时原样回传做一致性核对）。
+- `basis`：预览时刻当前会话的快照（确认时原样回传做一致性核对）。每条含三元组与分数；对预览中「分数变更/仅当前会话（删除）」的记录（其旧裁决会在确认时被清除）额外带 `decision` 快照 `{"has_decision": bool, "use_raw": bool, "reason": str}`，记录该评分当时的裁决存在性、采用原分与理由（本无裁决时 `has_decision=false`）。未变记录不带 `decision`，其裁决在合并中原样保留。
 
 **确认** `POST /api/sessions/{id}/merge/confirm`，JSON：
 
 ```json
 {
   "records": [{"contestant": "S01", "judge": "评委甲", "item": "技术展示", "score": 6.9}],
-  "basis": [{"contestant": "S01", "judge": "评委甲", "item": "技术展示", "score": 6.85}],
+  "basis": [{"contestant": "S01", "judge": "评委甲", "item": "技术展示", "score": 6.85,
+             "decision": {"has_decision": true, "use_raw": true, "reason": "人工保留"}}],
   "scope": "judge"
 }
 ```
 
 - `records`/`basis` 取自预览响应；`scope` 仅在会话尚不存在时用于创建会话，已有会话保持当前校准范围；
 - `200`：返回与 `GET analysis` 同构的最新分析，并附 `merge_applied.counts` 与 `merge_applied.decisions_cleared`；
-- `400`：记录不合法（缺字段、分数非数字、三元组重复等，错误信息含第几条）；
-- `409`：`basis` 与当前库不一致（预览后数据被其他操作改动），需重新预览；
+- `400`：记录不合法（缺字段、分数非数字、三元组重复等，错误信息含第几条）或 `basis` 快照形状不正确；
+- `409`：同一事务内先核对评分、再核对受影响评分的裁决状态——`basis` 分数与当前库不一致，或预览后相关旧裁决被新增/修改（存在性、采用原分、理由任一变化）时返回，需重新预览，且不写入任何合并结果；未变记录上的裁决与已保存规则不参与核对、保持原样；
 - 事务内任何异常都会整体回滚，取消（不发确认请求）自然不改任何数据。
 
 ### 评委排序分歧结果结构

@@ -18,7 +18,9 @@ from .judge_offsets import judge_offset_diagnosis
 from .merge import (
     STATUS_LABELS as MERGE_STATUS_LABELS,
     MergeValidationError,
+    basis_decisions_match,
     basis_matches,
+    basis_shape_valid,
     build_merge_plan,
     current_basis,
     normalize_incoming_records,
@@ -282,42 +284,41 @@ async def merge_preview(
         "will_modify": plan["will_modify"],
         "decisions_cleared": plan["decisions_cleared"],
         "records": records,
-        "basis": current_basis(current),
+        "basis": current_basis(current, plan["rows"]),
     }
 
 
 @app.post("/api/sessions/{session_id}/merge/confirm")
 def merge_confirm(session_id: str, body: MergeConfirmBody) -> dict[str, Any]:
-    """确认合并：在同一个数据库事务中落库预览结果。
+    """确认合并：在同一个数据库事务中核对基线并落库预览结果。
 
-    分数变更/删除记录的旧裁决在事务内自动清除；未变记录及其裁决、已保存的
-    批处理规则均不触碰。若预览后会话数据被其他操作改动（基线不匹配），
-    返回 409 要求重新预览，绝不覆盖。
+    先核对评分基线，再对预览时「变更/删除」记录的旧裁决（存在性、采用
+    原分、理由）逐条核对：预览后这些裁决若被新增或改动，返回 409 要求
+    重新预览，且不写入任何合并结果。未变记录上的裁决与已保存批处理
+    规则均不触碰；核对通过后，分数变更/删除记录的旧裁决在事务内自动
+    清除，清除数量与预览一致。
     """
     try:
         records = normalize_incoming_records(body.records)
     except MergeValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    if not all(
-        isinstance(item, dict)
-        and isinstance(item.get("contestant"), str)
-        and isinstance(item.get("judge"), str)
-        and isinstance(item.get("item"), str)
-        and isinstance(item.get("score"), (int, float))
-        and not isinstance(item.get("score"), bool)
-        for item in body.basis
-    ):
+    if not basis_shape_valid(body.basis):
         raise HTTPException(status_code=400, detail="basis 基线快照格式不正确，请重新预览。")
     with db.get_conn() as conn:
         current = db.load_scores(conn, session_id)
-        decisions = db.load_decisions(conn, session_id)
         stored_scope = db.get_scope(conn, session_id)
         if not basis_matches(body.basis, current):
             raise HTTPException(
                 status_code=409,
                 detail="预览后当前会话数据已变化，请重新预览后再确认合并。",
             )
+        decisions = db.load_decisions(conn, session_id)
         plan = build_merge_plan(current, records, decisions)
+        if not basis_decisions_match(body.basis, plan["rows"], decisions):
+            raise HTTPException(
+                status_code=409,
+                detail="预览后相关旧裁决已变化（新增或被修改），为避免未告知的裁决丢失，请重新预览后再确认合并。",
+            )
         # 全部变更随本事务一起提交；任何失败整体回滚。
         if stored_scope is None:
             db.ensure_session(conn, session_id, body.scope or SCOPE_JUDGE)

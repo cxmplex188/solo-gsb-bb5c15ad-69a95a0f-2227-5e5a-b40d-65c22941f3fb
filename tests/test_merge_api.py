@@ -105,6 +105,20 @@ class TestMergeAPI(unittest.TestCase):
         # Payload needed for confirm is echoed back.
         self.assertEqual(len(p["records"]), 5)
         self.assertEqual(len(p["basis"]), 4)
+        # 基线对「变更/删除」行记录旧裁决状态；未变行不记录。
+        basis = {
+            (b["contestant"], b["judge"], b["item"]): b for b in p["basis"]
+        }
+        self.assertEqual(basis[("C1", "JA", "P1")]["decision"],
+                         {"has_decision": True, "use_raw": True, "reason": "人工保留甲"})
+        # C2/JB 是变更行但本无裁决：快照记录「不存在」，防止预览后补裁决被静默清除。
+        self.assertEqual(basis[("C2", "JB", "P1")]["decision"],
+                         {"has_decision": False, "use_raw": False, "reason": ""})
+        # C2/JA 删除行无裁决，同样带存在性快照。
+        self.assertEqual(basis[("C2", "JA", "P1")]["decision"],
+                         {"has_decision": False, "use_raw": False, "reason": ""})
+        # 未变行（虽有裁决）不在核对范围。
+        self.assertNotIn("decision", basis[("C1", "JB", "P1")])
         # Bucket order: changed -> added -> removed -> unchanged.
         statuses = [x["status"] for x in p["rows"]]
         self.assertEqual(statuses, sorted(statuses, key={
@@ -156,6 +170,116 @@ class TestMergeAPI(unittest.TestCase):
         r = confirm({"records": p["records"] + [p["records"][0]], "basis": p["basis"]})
         self.assertEqual(r.status_code, 400)
         self.assertIn("重复", r.json()["detail"])
+
+    def test_04b_stale_decisions_conflict_without_writing(self):
+        """预览后新增/修改将清除的旧裁决时，旧预览确认必须 409 且不写入。"""
+        sid = "merge-stale-decisions"
+
+        def upload_sid(csv_text):
+            return client.post(
+                f"/api/sessions/{sid}/upload?scope=judge",
+                files={"file": ("s.csv", csv_text.encode("utf-8-sig"), "text/csv")},
+            )
+
+        def preview_sid(csv_text):
+            return client.post(
+                f"/api/sessions/{sid}/merge/preview",
+                files={"file": ("m.csv", csv_text.encode("utf-8-sig"), "text/csv")},
+            )
+
+        def confirm_sid(payload):
+            return client.post(f"/api/sessions/{sid}/merge/confirm", json=payload)
+
+        def ids():
+            a = client.get(f"/api/sessions/{sid}/analysis").json()
+            return {
+                (b["contestant"], s["judge"], ib["item"]): s["id"]
+                for b in a["contestants"] for ib in b["items"] for s in ib["scores"]
+            }
+
+        upload_sid(INITIAL)
+        id_of = ids()
+        # C1/JA（变更行）在预览前已有裁决。
+        client.patch(f"/api/sessions/{sid}/scores/{id_of[('C1', 'JA', 'P1')]}/decision",
+                     json={"use_raw": True, "reason": "人工保留甲"})
+
+        def assert_unchanged():
+            a = client.get(f"/api/sessions/{sid}/analysis").json()
+            self.assertEqual(a["counts"]["scores"], 4)
+            m = score_map(a)
+            self.assertEqual(m[("C1", "JA", "P1")]["raw"], 8.0)
+            self.assertIn(("C2", "JA", "P1"), m)
+            self.assertNotIn(("C3", "JA", "P1"), m)
+
+        # 情形一：预览后给「本无裁决的变更行」补裁决。
+        p = preview_sid(MERGED).json()
+        client.patch(f"/api/sessions/{sid}/scores/{id_of[('C2', 'JB', 'P1')]}/decision",
+                     json={"use_raw": False, "reason": "预览后补的裁决"})
+        r = confirm_sid({"records": p["records"], "basis": p["basis"]})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("重新预览", r.json()["detail"])
+        assert_unchanged()
+        # 新补的裁决也不能丢。
+        m = score_map(client.get(f"/api/sessions/{sid}/analysis").json())
+        self.assertEqual(m[("C2", "JB", "P1")]["reason"], "预览后补的裁决")
+
+        # 情形二：预览后改动将清除的旧裁决（改理由 / 改采用原分 / 删除）。
+        client.post(f"/api/sessions/{sid}/decisions/reset")
+        client.patch(f"/api/sessions/{sid}/scores/{id_of[('C1', 'JA', 'P1')]}/decision",
+                     json={"use_raw": True, "reason": "人工保留甲"})
+        p = preview_sid(MERGED).json()
+        client.patch(f"/api/sessions/{sid}/scores/{id_of[('C1', 'JA', 'P1')]}/decision",
+                     json={"use_raw": False, "reason": "预览后改的理由"})
+        r = confirm_sid({"records": p["records"], "basis": p["basis"]})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("重新预览", r.json()["detail"])
+        assert_unchanged()
+        m = score_map(client.get(f"/api/sessions/{sid}/analysis").json())
+        self.assertEqual(m[("C1", "JA", "P1")]["reason"], "预览后改的理由")
+        self.assertFalse(m[("C1", "JA", "P1")]["use_raw"])
+
+        # 情形三：未变行的裁决在预览后变化不阻止确认（合并本就保留它）；
+        # 重新预览（基线已含最新裁决状态）后确认成功，清除数量与预览一致。
+        client.patch(f"/api/sessions/{sid}/scores/{id_of[('C1', 'JB', 'P1')]}/decision",
+                     json={"use_raw": True, "reason": "未变行新理由"})
+        p = preview_sid(MERGED).json()
+        self.assertEqual(p["decisions_cleared"], 1)
+        # 确认前再改一次未变行裁决：仍可提交，且该裁决原样保留为最新值。
+        client.patch(f"/api/sessions/{sid}/scores/{id_of[('C1', 'JB', 'P1')]}/decision",
+                     json={"use_raw": True, "reason": "未变行最新理由"})
+        r = confirm_sid({"records": p["records"], "basis": p["basis"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        self.assertEqual(data["merge_applied"]["decisions_cleared"], 1)
+        self.assertEqual(data["counts"]["scores"], 5)
+        # C1/JA 的旧裁决按预览清除；未变行 C1/JB 裁决保留为最新值。
+        self.assertEqual(data["counts"]["decisions"], 1)
+        m = score_map(data)
+        self.assertEqual(m[("C1", "JA", "P1")]["reason"], "")
+        self.assertFalse(m[("C1", "JA", "P1")]["use_raw"])
+        self.assertEqual(m[("C1", "JB", "P1")]["reason"], "未变行最新理由")
+
+    def test_04c_basis_decision_snapshot_shape_errors_are_400(self):
+        p = preview(MERGED).json()
+        bad_basis = [dict(b) for b in p["basis"]]
+        bad_basis[0]["decision"] = "nope"
+        r = confirm({"records": p["records"], "basis": bad_basis})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("重新预览", r.json()["detail"])
+
+    def test_04d_tampered_records_conflicts_without_writing(self):
+        # 确认时篡改 records，使某条变更变回未变（少清一条旧裁决）→ 409。
+        p = preview(MERGED).json()
+        tampered = [dict(r) for r in p["records"]]
+        for row in tampered:
+            if (row["contestant"], row["judge"], row["item"]) == ("C1", "JA", "P1"):
+                row["score"] = 8.0  # 与旧分相同 → 重新计算时变为 unchanged
+        r = confirm({"records": tampered, "basis": p["basis"]})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("重新预览", r.json()["detail"])
+        self.assertEqual(
+            client.get(f"/api/sessions/{SID}/analysis").json()["counts"]["scores"], 4
+        )
 
     def test_05_confirm_applies_in_transaction(self):
         p = preview(MERGED).json()

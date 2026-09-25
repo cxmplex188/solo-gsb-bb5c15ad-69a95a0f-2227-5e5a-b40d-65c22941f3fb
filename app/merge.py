@@ -10,6 +10,10 @@
 
 差异计算是纯函数，预览不触碰数据库；确认时由
 ``database.merge_scores`` 在单个事务内落库。
+
+预览基线（basis）除逐条评分外，还会为「变更/删除」记录快照其旧裁决
+状态（存在性、采用原分、理由）；确认时评分与裁决在同一事务内一并
+核对，任一项已变化即返回 409，要求重新预览，绝不落库。
 """
 from __future__ import annotations
 
@@ -36,6 +40,10 @@ DECISION_KEEP = "keep"     # 未变：现有裁决保持不动
 DECISION_NONE = "none"     # 该记录当前没有裁决
 
 
+# 这些状态会清除旧裁决，基线中必须记录其裁决状态并在确认时一并核对。
+AFFECTED_STATUSES = frozenset((STATUS_CHANGED, STATUS_REMOVED))
+
+
 class MergeValidationError(ValueError):
     """合并提交的 JSON 记录不合法（返回 400）。"""
 
@@ -46,11 +54,14 @@ def _triple(row: Mapping[str, Any]) -> tuple[str, str, str]:
 
 def _decision_info(
     decisions: Mapping[int, Any], score_id: int
-) -> tuple[bool, bool | None, str]:
-    """Return (exists, use_raw, reason) for a current score id."""
+) -> tuple[bool, bool, str]:
+    """Return (exists, use_raw, reason) for a current score id.
+
+    无裁决时 use_raw 恒为 False（该字段仅在裁决存在时有意义）。
+    """
     verdict = decisions.get(score_id)
     if verdict is None:
-        return False, None, ""
+        return False, False, ""
     return True, bool(verdict[0]), verdict[1] or ""
 
 
@@ -152,17 +163,40 @@ def build_merge_plan(
     }
 
 
-def current_basis(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """生成确认时回传的「预览基线」快照。"""
-    return [
-        {
+def _plan_row_by_id(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[int, Mapping[str, Any]]:
+    return {r["score_id"]: r for r in rows if r.get("score_id") is not None}
+
+
+def current_basis(
+    records: Sequence[Mapping[str, Any]],
+    rows: Sequence[Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """生成确认时回传的「预览基线」快照。
+
+    每条包含三元组与分数；对预览中「变更/删除」的记录（其旧裁决会在
+    确认时被清除）额外快照裁决状态 has_decision/use_raw/reason，使确认
+    端能发现预览后新增或改动的裁决。records 与 rows 均按当前行序对齐。
+    """
+    by_id = _plan_row_by_id(rows or [])
+    basis: list[dict[str, Any]] = []
+    for r in records:
+        item = {
             "contestant": r["contestant"],
             "judge": r["judge"],
             "item": r["item"],
             "score": float(r["score"]),
         }
-        for r in records
-    ]
+        plan_row = by_id.get(r["id"])
+        if plan_row is not None and plan_row["status"] in AFFECTED_STATUSES:
+            item["decision"] = {
+                "has_decision": bool(plan_row["has_decision"]),
+                "use_raw": bool(plan_row["old_use_raw"] or False),
+                "reason": plan_row["old_reason"] or "",
+            }
+        basis.append(item)
+    return basis
 
 
 def basis_matches(
@@ -184,6 +218,79 @@ def basis_matches(
         except (KeyError, TypeError, ValueError):
             return False
     return True
+
+
+def basis_shape_valid(basis: Any) -> bool:
+    """校验确认请求里 basis 的字段类型（语义过期归 409，形状错误归 400）。"""
+    if not isinstance(basis, list):
+        return False
+    for item in basis:
+        if not isinstance(item, Mapping):
+            return False
+        if not (
+            isinstance(item.get("contestant"), str)
+            and isinstance(item.get("judge"), str)
+            and isinstance(item.get("item"), str)
+            and isinstance(item.get("score"), (int, float))
+            and not isinstance(item.get("score"), bool)
+        ):
+            return False
+        if "decision" in item:
+            d = item["decision"]
+            if not isinstance(d, Mapping):
+                return False
+            if not isinstance(d.get("has_decision"), bool):
+                return False
+            # use_raw 仅在存在裁决时有效，但形状上必须是布尔；
+            # reason 必须是字符串。
+            if not isinstance(d.get("use_raw"), bool):
+                return False
+            if not isinstance(d.get("reason"), str):
+                return False
+    return True
+
+
+def basis_decisions_match(
+    basis: Sequence[Mapping[str, Any]],
+    plan_rows: Sequence[Mapping[str, Any]],
+    decisions: Mapping[int, Any],
+) -> bool:
+    """核对预览基线中的裁决快照是否仍与库内裁决一致。
+
+    仅核对预览时判定为「变更/删除」的评分（其余行的裁决在合并中原样
+    保留，不纳入过期判断）。要求：
+
+    - 受影响评分集合与预览完全一致（篡改 records 导致清除集合变化也算过期）；
+    - 每条受影响评分的裁决存在性、采用原分、理由均与快照相同。
+
+    调用方须先用 ``basis_matches`` 保证 basis 的三元组与库内评分一致；
+    同一会话内三元组唯一，故可直接按键定位计划行。
+    """
+    affected_plan = {
+        _triple(r): r
+        for r in plan_rows
+        if r["status"] in AFFECTED_STATUSES and r.get("score_id") is not None
+    }
+    affected_basis: set[tuple[str, str, str]] = set()
+    for b in basis:
+        snapshot = b.get("decision")
+        if snapshot is None:
+            continue
+        plan_row = affected_plan.get(_triple(b))
+        if plan_row is None:
+            return False
+        affected_basis.add(_triple(b))
+        has_now, use_raw_now, reason_now = _decision_info(
+            decisions, plan_row["score_id"]
+        )
+        if (
+            bool(snapshot["has_decision"]) != has_now
+            or bool(snapshot["use_raw"]) != use_raw_now
+            or snapshot["reason"] != reason_now
+        ):
+            return False
+    # 预览时所有受影响评分都应带有裁决快照；缺失说明基线被裁剪/篡改。
+    return affected_basis == set(affected_plan)
 
 
 def normalize_incoming_records(raw: Any) -> list[dict[str, Any]]:
